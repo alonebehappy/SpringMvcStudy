@@ -1,0 +1,46 @@
+<resultMap id="newBaseResultMap"
+		type="com.aproc.system.vo.NewResource">
+		<id column="id" property="id" jdbcType="BIGINT" />
+		<result column="parent_id" property="parentId" jdbcType="BIGINT" />
+		<result column="resource_type" property="resourceType"
+			jdbcType="BIT" />
+		<result column="name" property="name" jdbcType="VARCHAR" />
+		<result column="icon_class" property="iconClass" jdbcType="VARCHAR" />
+		<result column="url" property="url" jdbcType="VARCHAR" />
+		<result column="valid_flg" property="validFlg" jdbcType="BIT" />
+		<result column="sort" property="sort" jdbcType="INTEGER" />
+		<result column="add_emp" jdbcType="VARCHAR" property="addEmp" />
+		<result column="add_tm" jdbcType="TIMESTAMP" property="addTm" />
+		<result column="update_emp" jdbcType="VARCHAR" property="updateEmp" />
+		<result column="update_tm" jdbcType="TIMESTAMP" property="updateTm" />
+		<result column="user_id" jdbcType="VARCHAR" property="userId" />
+		<collection column="{id=id,userId=user_id}" property="childrenResource" 
+		ofType="com.aproc.system.vo.NewResource" select="selectChildrenById" />
+	</resultMap>
+	
+	<!-- 根据userId先查出所有一级菜单 -->
+    <select id="queryMenuByUserId" resultMap="newBaseResultMap">
+        select
+		distinct res.*,u.user_id
+		from (select * from tm_resource where resource_type = 1) res
+		left join tm_resource_role rr on res.id = rr.resource_id
+		left join tt_user_role ur on ur.role_id = rr.role_id
+		left join tm_user u on u.id = ur.user_id and u.is_enable = 1
+		where 1 = 1
+		and u.user_id = #{userId,jdbcType=VARCHAR}
+		and parent_id = 0
+		order by sort asc
+    </select>
+    
+    <!-- 再递归查询出一级部门下的所有子部门 -->
+    <select id="selectChildrenById" resultMap="newBaseResultMap">
+        select
+		distinct res.*,u.user_id
+		from (select * from tm_resource where resource_type = 1) res
+		left join tm_resource_role rr on res.id = rr.resource_id
+		left join tt_user_role ur on ur.role_id = rr.role_id
+		left join tm_user u on u.id = ur.user_id and u.is_enable = 1
+		where 1 = 1
+		and u.user_id = #{userId,jdbcType=VARCHAR}
+        and parent_id= #{id}
+    </select>
