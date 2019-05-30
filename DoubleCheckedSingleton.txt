@@ -1,0 +1,18 @@
+//双重检查锁
+public final class DoubleCheckedSingleton  
+{  
+    private static DoubleCheckedSingletonsingObj = null;  
+  
+    private DoubleCheckedSingleton(){  
+    }  
+  
+    public static DoubleCheckedSingleton getSingleInstance(){  
+        if(null == singObj ) {
+              Synchronized(DoubleCheckedSingleton.class){
+                     if(null == singObj)
+                           singObj = new DoubleCheckedSingleton();
+              }
+         }
+       return singObj；
+    }  
+}
