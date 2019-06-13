@@ -1,0 +1,578 @@
+在实际项目开发过程中，定时任务几乎是必不可少的。作为Java程序员用的最多的任务调度框架非Quartz莫属了。 
+在Quartz中配置任务的方式很多，比较常见的就有基于注解配置、基于XML等配置文件进行配置和通过数据库进行配置三种配置方式，具体应该使用哪种方式来对定时任务进行配置需要根据你的实际业务场景来进行选择，这不是本文要讨论的重点，本文仅对如何使用数据库实现对定时任务的动态灵活配置进行简单示例和介绍。
+
+ 
+
+一、数据库字段
+
+1、task_schedule_job表，用来存储定时任务的基本信息
+
+CREATE TABLE `task_schedule_job` (
+  `job_id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `create_time` timestamp NULL DEFAULT NULL COMMENT '创建时间',
+  `update_time` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '修改时间',
+  `job_name` varchar(255) DEFAULT NULL COMMENT '定时任务名称',
+  `job_group` varchar(255) DEFAULT NULL COMMENT '所属服务',
+  `job_status` varchar(255) DEFAULT NULL COMMENT '是否开启',
+  `cron_expression` varchar(255) NOT NULL COMMENT 'cron表达式',
+  `description` varchar(255) DEFAULT '0' COMMENT '描述 0:集群全部执行 1:单节点执行',
+  `bean_class` varchar(255) DEFAULT NULL COMMENT '类路径',
+  `is_concurrent` varchar(255) DEFAULT NULL COMMENT '是否需要顺序执行',
+  `spring_id` varchar(255) DEFAULT NULL COMMENT 'springid',
+  `method_name` varchar(255) NOT NULL COMMENT '方法名',
+  PRIMARY KEY (`job_id`),
+  UNIQUE KEY `name_group` (`job_name`,`job_group`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=51 DEFAULT CHARSET=utf8;
+
+2、task_schedule_time表，用来存储定时执行状态和日志，其中name和state设置成唯一索引，保证微服务中只有一个定时任务在执行。
+
+CREATE TABLE `task_schedule_time` (
+  `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键',
+  `name` varchar(255) DEFAULT NULL COMMENT '任务名称',
+  `stime` datetime DEFAULT NULL COMMENT '开始时间',
+  `etime` datetime DEFAULT NULL COMMENT '结束时间',
+  `flag` varchar(255) DEFAULT NULL COMMENT '执行结果(S成功E失败)',
+  `state` varchar(20) DEFAULT NULL COMMENT '执行状态（0执行中）',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `name` (`name`,`state`) USING BTREE
+) ENGINE=InnoDB AUTO_INCREMENT=2552705 DEFAULT CHARSET=utf8;
+
+二、项目集成
+
+针对项目集成部分，task_schedule_job和task_schedule_time的增删改查就不再累赘编写。
+
+1、增加quartz的依赖
+
+ <dependency>
+    <groupId>org.quartz-scheduler</groupId>
+    <artifactId>quartz</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.quartz-scheduler</groupId>
+    <artifactId>quartz-jobs</artifactId>
+</dependency>
+ 2、创建要被执行的任务类，实现job接口中的excute方法，其中使用两种方式实现，无状态和有状态的定时任务。
+
+无状态：不管上次定时任务是否执行完都再次执行
+
+有状态：等待上次定时任务是否执行完都再次执行
+
+ public class QuartzJobFactory implements Job {
+   public final Logger log = Logger.getLogger(this.getClass());
+
+   @Override
+   public void execute(JobExecutionContext context) throws JobExecutionException {
+      ScheduleJob scheduleJob = (ScheduleJob) context.getMergedJobDataMap().get("scheduleJob");
+      TaskUtils.invokMethod(scheduleJob);
+   }
+}
+ @DisallowConcurrentExecution
+
+public class QuartzJobFactoryDisallowConcurrentExecution implements Job {
+   public final Logger log = Logger.getLogger(this.getClass());
+
+   @Override
+   public void execute(JobExecutionContext context) throws JobExecutionException {
+      ScheduleJob scheduleJob = (ScheduleJob) context.getMergedJobDataMap().get("scheduleJob");
+      TaskUtils.invokMethod(scheduleJob);
+
+   }
+}
+ public class TaskUtils {
+    public final static Logger log = Logger.getLogger(TaskUtils.class);
+
+    /**
+     * 通过反射调用scheduleJob中定义的方法
+     * 
+     * @param scheduleJob
+     */
+    public static void invokMethod(ScheduleJob scheduleJob) {
+        Object object = null;
+        Class clazz = null;
+        if (StringUtils.isNotBlank(scheduleJob.getSpringId())) {
+            object = SpringContextHolder.getBean(scheduleJob.getSpringId());
+        } else if (StringUtils.isNotBlank(scheduleJob.getBeanClass())) {
+            try {
+                clazz = Class.forName(scheduleJob.getBeanClass());
+                object = clazz.newInstance();
+            } catch (Exception e) {
+                // TODO Auto-generated catch block
+                e.printStackTrace();
+            }
+
+        }
+        if (object == null) {
+            log.error("任务名称 = [" + scheduleJob.getJobName() + "]---------------未启动成功，请检查是否配置正确！！！");
+            return;
+        }
+        clazz = object.getClass();
+        Method method = null;
+        TaskTimeService taskTimeService = SpringContextHolder.getBean(TaskTimeService.class);
+        try {
+
+            method = clazz.getDeclaredMethod(scheduleJob.getMethodName());
+
+        } catch (NoSuchMethodException e) {
+            log.error("任务名称 = [" + scheduleJob.getJobName() + "]---------------未启动成功，方法名设置错误！！！");
+        } catch (SecurityException e) {
+            // TODO Auto-generated catch block
+            e.printStackTrace();
+        }
+        if (method != null) {
+
+            if(!taskTimeService.getTaskJobState(scheduleJob.getJobName(),"0") && "1".equals(scheduleJob.getDescription()))
+            {//如果此任务正在执行，则其他集群上服务不再执行此任务
+                return;
+            }
+            TaskScheduleTime taskScheduleTime = new TaskScheduleTime();
+            try {
+                taskScheduleTime.setName(scheduleJob.getJobName());
+                taskScheduleTime.setStime(new Date());
+                if("1".equals(scheduleJob.getDescription()))
+                {
+                    taskScheduleTime.setState("0");
+                }
+                try {
+                    taskTimeService.addTime(taskScheduleTime);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                    return;
+                }
+                method.invoke(object);
+                taskScheduleTime.setEtime(new Date());
+                taskScheduleTime.setFlag("S");
+                taskScheduleTime.setState(null);
+                taskTimeService.editTime(taskScheduleTime);
+            } catch (Exception e) {
+                log.error("任务名称 = [" + scheduleJob.getJobName() + "]调用过程中出现异常:", e);
+                taskScheduleTime.setEtime(new Date());
+                taskScheduleTime.setFlag("F");
+                taskScheduleTime.setState(null);
+                taskTimeService.editTime(taskScheduleTime);
+                //jobExectErrorEmailNotice(scheduleJob, e.getMessage());
+
+            }
+        }
+        System.out.println("任务名称 = [" + scheduleJob.getJobName() + "]----------启动成功");
+    }
+}
+
+ 3、注入SchedulerFactoryBean
+
+ @Configuration
+public class TaskConfig {
+
+    @Bean(name = "schedulerFactoryBean")
+    public SchedulerFactoryBean getSchedulerFactoryBean(){
+        return new SchedulerFactoryBean();
+    }
+}
+4、针对于job的操作和程序启动入口
+
+ @Service
+public class JobTaskService {
+   public final Logger log = Logger.getLogger(this.getClass());
+   @Autowired
+   private SchedulerFactoryBean schedulerFactoryBean;
+
+   @Autowired
+   private ScheduleJobDao scheduleJobDao;
+
+   /**
+    * 从数据库中取 区别于getAllJob
+    * 
+    * @return
+    */
+   public List<ScheduleJob> getAllTask() {
+      return scheduleJobDao.getAll();
+   }
+
+   /**
+    * 添加到数据库中 区别于addJob
+    */
+   public void addTask(ScheduleJob job) {
+      job.setCreateTime(new Date());
+      scheduleJobDao.insertSelective(job);
+   }
+
+   /**
+    * 从数据库中查询job
+    */
+   public ScheduleJob getTaskById(Long jobId) {
+      return scheduleJobDao.selectByPrimaryKey(jobId);
+   }
+
+   /**
+    * 更改任务状态
+    * 
+    * @throws SchedulerException
+    */
+   public void changeStatus(Long jobId, String cmd) throws SchedulerException {
+      ScheduleJob job = getTaskById(jobId);
+      if (job == null) {
+         return;
+      }
+      if ("stop".equals(cmd)) {
+         deleteJob(job);
+         job.setJobStatus(ScheduleJob.STATUS_NOT_RUNNING);
+      } else if ("start".equals(cmd)) {
+         job.setJobStatus(ScheduleJob.STATUS_RUNNING);
+         addJob(job);
+      }
+      scheduleJobDao.updateByPrimaryKeySelective(job);
+   }
+
+   /**
+    * 更改任务 cron表达式
+    * 
+    * @throws SchedulerException
+    */
+   public void updateCron(Long jobId, String cron) throws SchedulerException {
+      ScheduleJob job = getTaskById(jobId);
+      if (job == null) {
+         return;
+      }
+      job.setCronExpression(cron);
+      if (ScheduleJob.STATUS_RUNNING.equals(job.getJobStatus())) {
+         updateJobCron(job);
+      }
+      scheduleJobDao.updateByPrimaryKeySelective(job);
+
+   }
+
+   /**
+    * 添加任务
+    * @throws SchedulerException
+    */
+   public void addJob(ScheduleJob job) throws SchedulerException {
+      if (job == null || !ScheduleJob.STATUS_RUNNING.equals(job.getJobStatus())) {
+         return;
+      }
+
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      log.debug(scheduler + ".......................................................................................add");
+      TriggerKey triggerKey = TriggerKey.triggerKey(job.getJobName(), job.getJobGroup());
+
+      CronTrigger trigger = (CronTrigger) scheduler.getTrigger(triggerKey);
+
+      // 不存在，创建一个
+      if (null == trigger) {
+         Class clazz = ScheduleJob.CONCURRENT_IS.equals(job.getIsConcurrent()) ? QuartzJobFactory.class : QuartzJobFactoryDisallowConcurrentExecution.class;
+
+         JobDetail jobDetail = JobBuilder.newJob(clazz).withIdentity(job.getJobName(), job.getJobGroup()).build();
+
+         jobDetail.getJobDataMap().put("scheduleJob", job);
+
+         CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule(job.getCronExpression());
+
+         trigger = TriggerBuilder.newTrigger().withIdentity(job.getJobName(), job.getJobGroup()).withSchedule(scheduleBuilder).build();
+
+         scheduler.scheduleJob(jobDetail, trigger);
+      } else {
+         // Trigger已存在，那么更新相应的定时设置
+         CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule(job.getCronExpression());
+
+         // 按新的cronExpression表达式重新构建trigger
+         trigger = trigger.getTriggerBuilder().withIdentity(triggerKey).withSchedule(scheduleBuilder).build();
+
+         // 按新的trigger重新设置job执行
+         scheduler.rescheduleJob(triggerKey, trigger);
+      }
+   }
+
+   //@PostConstruct
+   public void init(String group) throws Exception {
+      String startSchedule = "true";
+      if ("true".equals(startSchedule)) {
+         Scheduler scheduler = schedulerFactoryBean.getScheduler();
+         // 这里获取任务信息数据
+         List<ScheduleJob> jobList = scheduleJobDao.getAllByGroup(group);
+         for (ScheduleJob job : jobList) {
+            addJob(job);
+         }
+      } else {
+         return;
+      }
+   }
+
+   /**
+    * 获取所有计划中的任务列表
+    * 
+    * @return
+    * @throws SchedulerException
+    */
+   public List<ScheduleJob> getAllJob() throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      GroupMatcher<JobKey> matcher = GroupMatcher.anyJobGroup();
+      Set<JobKey> jobKeys = scheduler.getJobKeys(matcher);
+      List<ScheduleJob> jobList = new ArrayList<ScheduleJob>();
+      for (JobKey jobKey : jobKeys) {
+         List<? extends Trigger> triggers = scheduler.getTriggersOfJob(jobKey);
+         for (Trigger trigger : triggers) {
+            ScheduleJob job = new ScheduleJob();
+            job.setJobName(jobKey.getName());
+            job.setJobGroup(jobKey.getGroup());
+            job.setDescription("触发器:" + trigger.getKey());
+            Trigger.TriggerState triggerState = scheduler.getTriggerState(trigger.getKey());
+            job.setJobStatus(triggerState.name());
+            if (trigger instanceof CronTrigger) {
+               CronTrigger cronTrigger = (CronTrigger) trigger;
+               String cronExpression = cronTrigger.getCronExpression();
+               job.setCronExpression(cronExpression);
+            }
+            jobList.add(job);
+         }
+      }
+      return jobList;
+   }
+
+   /**
+    * 所有正在运行的job
+    * 
+    * @return
+    * @throws SchedulerException
+    */
+   public List<ScheduleJob> getRunningJob() throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      List<JobExecutionContext> executingJobs = scheduler.getCurrentlyExecutingJobs();
+      List<ScheduleJob> jobList = new ArrayList<ScheduleJob>(executingJobs.size());
+      for (JobExecutionContext executingJob : executingJobs) {
+         ScheduleJob job = new ScheduleJob();
+         JobDetail jobDetail = executingJob.getJobDetail();
+         JobKey jobKey = jobDetail.getKey();
+         Trigger trigger = executingJob.getTrigger();
+         job.setJobName(jobKey.getName());
+         job.setJobGroup(jobKey.getGroup());
+         job.setDescription("触发器:" + trigger.getKey());
+         Trigger.TriggerState triggerState = scheduler.getTriggerState(trigger.getKey());
+         job.setJobStatus(triggerState.name());
+         if (trigger instanceof CronTrigger) {
+            CronTrigger cronTrigger = (CronTrigger) trigger;
+            String cronExpression = cronTrigger.getCronExpression();
+            job.setCronExpression(cronExpression);
+         }
+         jobList.add(job);
+      }
+      return jobList;
+   }
+
+   /**
+    * 暂停一个job
+    * 
+    * @param scheduleJob
+    * @throws SchedulerException
+    */
+   public void pauseJob(ScheduleJob scheduleJob) throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      JobKey jobKey = JobKey.jobKey(scheduleJob.getJobName(), scheduleJob.getJobGroup());
+      scheduler.pauseJob(jobKey);
+   }
+
+   /**
+    * 恢复一个job
+    * 
+    * @param scheduleJob
+    * @throws SchedulerException
+    */
+   public void resumeJob(ScheduleJob scheduleJob) throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      JobKey jobKey = JobKey.jobKey(scheduleJob.getJobName(), scheduleJob.getJobGroup());
+      scheduler.resumeJob(jobKey);
+   }
+
+   /**
+    * 删除一个job
+    * 
+    * @param scheduleJob
+    * @throws SchedulerException
+    */
+   public void deleteJob(ScheduleJob scheduleJob) throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      JobKey jobKey = JobKey.jobKey(scheduleJob.getJobName(), scheduleJob.getJobGroup());
+      scheduler.deleteJob(jobKey);
+
+   }
+
+   /**
+    * 立即执行job
+    * 
+    * @param scheduleJob
+    * @throws SchedulerException
+    */
+   public void runAJobNow(ScheduleJob scheduleJob) throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+      JobKey jobKey = JobKey.jobKey(scheduleJob.getJobName(), scheduleJob.getJobGroup());
+      scheduler.triggerJob(jobKey);
+   }
+
+   /**
+    * 更新job时间表达式
+    * 
+    * @param scheduleJob
+    * @throws SchedulerException
+    */
+   public void updateJobCron(ScheduleJob scheduleJob) throws SchedulerException {
+      Scheduler scheduler = schedulerFactoryBean.getScheduler();
+
+      TriggerKey triggerKey = TriggerKey.triggerKey(scheduleJob.getJobName(), scheduleJob.getJobGroup());
+
+      CronTrigger trigger = (CronTrigger) scheduler.getTrigger(triggerKey);
+
+      CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule(scheduleJob.getCronExpression());
+
+      trigger = trigger.getTriggerBuilder().withIdentity(triggerKey).withSchedule(scheduleBuilder).build();
+
+      scheduler.rescheduleJob(triggerKey, trigger);
+   }
+
+   public static void main(String[] args) {
+      CronScheduleBuilder scheduleBuilder = CronScheduleBuilder.cronSchedule("xxxxx");
+   }
+}
+ 5、关于定时任务状态和日志的操作类
+
+ @Service
+public class TaskTimeService{
+   @Autowired
+   private TaskScheduleTimeDao taskScheduleTimeDao;
+   
+   public void addTime(TaskScheduleTime taskScheduleTime)
+   {
+      taskScheduleTimeDao.insertSelective(taskScheduleTime);
+   }
+
+   public void editTime(TaskScheduleTime taskScheduleTime)
+   {
+      taskScheduleTimeDao.updateByPrimaryKeySelective(taskScheduleTime);
+   }
+
+/**
+ * 判断当前计划任务是否可执行
+ * true：可执行，false：不可执行
+ * @param name
+ * @param state
+ * @return
+ */
+public Boolean getTaskJobState(String name,String state)
+{
+   Boolean flag = true;
+   TaskScheduleTime taskScheduleTime = taskScheduleTimeDao.selectByNameAndState(name,state);
+   if(taskScheduleTime != null)
+   {
+      flag = false;
+   }
+   return flag;
+}
+
+
+}
+
+ 
+
+总结：任务
+
+@Autowired
+
+private SchedulerFactoryBean schedulerFactoryBean; 可以改成以下 直接进行任务操作
+
+@Autowired
+private Scheduler scheduler;    两者效果一样。   任务进入scheduler后，会自动调用无需在写其他代码。
+
+上面没有对数据表定时扫描。对于任务的操作，直接操作scheduler。    但是有一个缺陷就是，项目重启任务会失效，需要从新启动任务。   解决方案两种。
+
+第一种如下：
+
+ 在项目启动，初始化的时候读取数据写入scheduler。
+
+@Component
+@Order(value = 1)
+public class ScheduleJobInitListener implements CommandLineRunner {
+
+    @Autowired
+    JobService scheduleJobService;
+
+    @Autowired
+    QuartzManager quartzManager;
+
+    @Override
+    public void run(String... arg0) throws Exception {
+        try {
+            scheduleJobService.initSchedule();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+    }
+
+}
+
+@Service
+public class JobServiceImpl implements JobService {
+
+    private static final org.slf4j.Logger logger = LoggerFactory.getLogger(JobServiceImpl.class);
+    
+    @Autowired
+    private TaskDao taskScheduleJobMapper;
+
+    @Autowired
+    QuartzManager quartzManager;
+
+@Override
+    public void initSchedule() throws SchedulerException {
+        // 这里获取任务信息数据
+        List<TaskDO> jobList = taskScheduleJobMapper.list(new HashMap<String, Object>(16));
+        for (TaskDO scheduleJob : jobList) {
+            if ("1".equals(scheduleJob.getJobStatus())) {
+                ScheduleJob job = ScheduleJobUtils.entityToData(scheduleJob);
+                quartzManager.addJob(job);
+            }
+
+        }
+    }
+
+}
+
+第二种：
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import com.test.quartz.service.ScheduleTriggerService;
+import com.test.database.util.DataSourceContextHolder;
+import com.test.database.util.DataSourceTypeContextHolder;
+
+@Component
+public class PaymentCalcTask {
+
+    /** logger-logback */
+    private static final Logger logger = LoggerFactory.getLogger(PaymentCalcTask .class);
+
+    @Autowired
+    private ScheduleTriggerService scheduleTriggerService;
+
+    /**
+     * 每30秒扫描一次数据库，执行数据库中的定时任务
+     * 有分库，需要每个分库执行一次
+     * 
+     * @throws Exception
+     */
+    @Scheduled(cron = "0/30 * * * * ?")
+    public void paymentCacl() throws Exception {
+        logger.info("===↓↓↓↓↓===正在刷新定时任务===↓↓↓↓↓===");
+        Long start = System.currentTimeMillis();
+        DataSourceTypeContextHolder.setWrite();
+        DataSourceContextHolder.setDB00();
+        scheduleTriggerService.refreshTrigger();
+        Long cost = System.currentTimeMillis() - start;
+        logger.info("===↑↑↑↑↑===结束刷新定时任务,耗时："+cost+"ms===↑↑↑↑↑===");
+    }
+}
+两者还需要做进一步的优化，来提高服务器资源的利用。  
+--------------------- 
+作者：u010494101 
+来源：CSDN 
+原文：https://blog.csdn.net/u010494101/article/details/85597558 
+版权声明：本文为博主原创文章，转载请附上博文链接！
