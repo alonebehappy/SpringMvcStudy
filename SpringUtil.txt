@@ -1,0 +1,39 @@
+package me.arganzheng.study.quartz.task.SpringBeanJobFactory;
+import org.quartz.spi.TriggerFiredBundle;
+import org.springframework.beans.BeansException;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextAware;
+/**
+ * 自定义SpringBeanJobFactory，用于对Job注入ApplicationContext等。
+ * 
+ * @author arganzheng
+ */
+public class SpringBeanJobFactory extends org.springframework.scheduling.quartz.SpringBeanJobFactory implements ApplicationContextAware {
+    private ApplicationContext applicationContext;
+    @Override
+    public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+        this.applicationContext = applicationContext;
+    }
+    /**
+     * 这里我们覆盖了super的createJobInstance方法，对其创建出来的类再进行autowire。
+     */
+    @Override
+    protected Object createJobInstance(TriggerFiredBundle bundle) throws Exception {
+        Object jobInstance = super.createJobInstance(bundle);
+        applicationContext.getAutowireCapableBeanFactory().autowireBean(jobInstance);
+        return jobInstance;
+    }
+}
+
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+       http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-2.0.xsd">
+    <bean class="org.springframework.scheduling.quartz.SchedulerFactoryBean">
+        <property name="jobFactory">
+            <bean class="me.arganzheng.study.quartz.task.SpringBeanJobFactory" />
+        </property>
+        ...
+    </bean>
+</beans>
