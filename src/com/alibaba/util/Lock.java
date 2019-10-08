@@ -1,4 +1,4 @@
-package com.zpc.zklock;
+package com.alibaba.util;
 
 /**
  * 面向接口编程
